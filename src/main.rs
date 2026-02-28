@@ -16,7 +16,7 @@ use http_proxy::proxy_http_connection;
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt, Splitable};
 use monoio::net::tcp::{TcpOwnedReadHalf, TcpOwnedWriteHalf};
 use monoio::net::TcpListener;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -227,6 +227,7 @@ fn run_worker(
     active_connections: Arc<AtomicUsize>,
     file_cache: Option<Arc<static_files::FileCache>>,
     tls_acceptor: Option<monoio_rustls::TlsAcceptor>,
+    shutdown: Arc<AtomicBool>,
 ) {
     // Pin thread to CPU core for better cache locality
     #[cfg(target_os = "linux")]
@@ -280,8 +281,21 @@ fn run_worker(
             if tls_acceptor.is_some() { " (TLS)" } else { "" });
 
         loop {
+            // Check for shutdown signal
+            if shutdown.load(Ordering::Relaxed) {
+                info!("Worker {} received shutdown signal, draining connections...", worker_id);
+                break;
+            }
+
             match listener.accept().await {
                 Ok((stream, addr)) => {
+                    // Double-check shutdown after accept returns
+                    if shutdown.load(Ordering::Relaxed) {
+                        // Reject new connection during shutdown
+                        drop(stream);
+                        break;
+                    }
+
                     let mode = lb.proxy_mode();
                     let conn_num = total_connections.fetch_add(1, Ordering::Relaxed);
                     let active = active_connections.fetch_add(1, Ordering::Relaxed) + 1;
@@ -429,10 +443,29 @@ fn run_worker(
                     }
                 }
                 Err(e) => {
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
                     error!("Accept error: {}", e);
                 }
             }
         }
+
+        // Drain active connections with timeout
+        let drain_start = std::time::Instant::now();
+        let drain_timeout = std::time::Duration::from_secs(30);
+
+        while active_connections.load(Ordering::Relaxed) > 0 {
+            if drain_start.elapsed() > drain_timeout {
+                let remaining = active_connections.load(Ordering::Relaxed);
+                warn!("Worker {} drain timeout, {} connections still active", worker_id, remaining);
+                break;
+            }
+            // Yield to let connections complete
+            monoio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        info!("Worker {} shutdown complete", worker_id);
     });
 }
 
@@ -533,6 +566,9 @@ fn main() -> Result<()> {
         None
     };
 
+    // Graceful shutdown flag
+    let shutdown = Arc::new(AtomicBool::new(false));
+
     // Spawn worker threads
     let mut handles = Vec::new();
     for worker_id in 0..num_workers {
@@ -542,11 +578,12 @@ fn main() -> Result<()> {
         let active = Arc::clone(&active_connections);
         let cache = file_cache.clone();
         let tls = tls_acceptor.clone();
+        let shutdown = Arc::clone(&shutdown);
 
         let handle = std::thread::Builder::new()
             .name(format!("atlas-worker-{}", worker_id))
             .spawn(move || {
-                run_worker(worker_id, listen_addr, lb, total, active, cache, tls);
+                run_worker(worker_id, listen_addr, lb, total, active, cache, tls, shutdown);
             })
             .expect("Failed to spawn worker thread");
 
@@ -555,10 +592,61 @@ fn main() -> Result<()> {
 
     info!("All {} workers started", num_workers);
 
-    // Wait for all workers (they run forever)
+    // Set up signal handling for graceful shutdown
+    #[cfg(unix)]
+    {
+        use std::sync::mpsc::channel;
+        let (sig_tx, sig_rx) = channel();
+        let shutdown_flag = Arc::clone(&shutdown);
+
+        // Spawn signal handler thread
+        std::thread::spawn(move || {
+            use libc::{SIGINT, SIGTERM, SIGQUIT};
+
+            let mut signals = [0i32; 3];
+            signals[0] = SIGTERM;
+            signals[1] = SIGINT;
+            signals[2] = SIGQUIT;
+
+            // Block signals in this thread and wait for them
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                for &sig in &signals {
+                    libc::sigaddset(&mut set, sig);
+                }
+                libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+
+                let mut sig: libc::c_int = 0;
+                libc::sigwait(&set, &mut sig);
+
+                info!("Received signal {}, initiating graceful shutdown...", sig);
+                shutdown_flag.store(true, Ordering::SeqCst);
+                let _ = sig_tx.send(());
+            }
+        });
+
+        // Wait for shutdown signal
+        let _ = sig_rx.recv();
+
+        info!("Waiting for workers to drain connections (30s timeout)...");
+    }
+
+    #[cfg(not(unix))]
+    {
+        // On non-Unix, just wait forever
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
+
+    // Wait for all workers to complete
     for handle in handles {
         handle.join().expect("Worker thread panicked");
     }
+
+    let total = total_connections.load(Ordering::Relaxed);
+    info!("Atlas shutdown complete. Served {} total connections.", total);
 
     Ok(())
 }
