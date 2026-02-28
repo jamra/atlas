@@ -84,6 +84,32 @@ strategy = "round_robin"  # round_robin, random, least_connections
 root = "/var/www/html"
 ```
 
+## Hot Reload
+
+Atlas watches the config file for changes and automatically reloads:
+- Upstream server list
+- Load balancing strategy
+- Routing rules
+
+Changes take effect immediately without restarting.
+
+## Zero-Downtime Deployments
+
+Atlas supports graceful shutdown for zero-downtime deployments:
+
+```bash
+# 1. Start new Atlas version (binds alongside old via SO_REUSEPORT)
+./atlas-new config.toml &
+
+# 2. Signal old process to drain
+kill -TERM $OLD_PID
+
+# 3. Old process stops accepting, drains connections (30s timeout), exits
+```
+
+Signals:
+- `SIGTERM` / `SIGINT` / `SIGQUIT` - Graceful shutdown (drain connections)
+
 ## Architecture
 
 - **monoio runtime** - Async runtime using io_uring on Linux, falling back to epoll/kqueue elsewhere
