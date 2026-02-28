@@ -1,0 +1,46 @@
+# Atlas Load Balancing Configuration
+#
+# This configuration demonstrates load balancing across multiple backends
+# with weighted round-robin distribution.
+
+[listen]
+# Bind address - use 0.0.0.0 for all interfaces
+address = "0.0.0.0"
+
+# Port to listen on
+port = 8080
+
+# Mode: "http" for HTTP reverse proxy
+mode = "http"
+
+# Number of worker threads
+workers = 4
+
+# Backend servers with weights
+# Higher weight = more traffic
+
+[[upstreams]]
+name = "backend1"
+address = "127.0.0.1"
+port = 3001
+weight = 3  # Gets 3x traffic
+
+[[upstreams]]
+name = "backend2"
+address = "127.0.0.1"
+port = 3002
+weight = 2  # Gets 2x traffic
+
+[[upstreams]]
+name = "backend3"
+address = "127.0.0.1"
+port = 3003
+weight = 1  # Gets 1x traffic (baseline)
+
+[routing]
+# Load balancing strategy
+# Options:
+#   round_robin          - Equal distribution, ignores weights
+#   weighted_round_robin - Proportional distribution based on weights
+#   random               - Random selection, ignores weights
+strategy = "weighted_round_robin"

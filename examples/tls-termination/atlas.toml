@@ -1,0 +1,35 @@
+# Atlas TLS Termination Configuration
+#
+# This configuration terminates TLS (HTTPS) and proxies to HTTP backends.
+# Uses rustls for a memory-safe, high-performance TLS implementation.
+
+[listen]
+# Bind address - use 0.0.0.0 for all interfaces
+address = "0.0.0.0"
+
+# HTTPS port
+port = 443
+
+# Mode: "http" for HTTP reverse proxy
+mode = "http"
+
+# Number of worker threads
+workers = 4
+
+# TLS configuration
+[listen.tls]
+# Path to certificate file (PEM format)
+# Should contain the full chain: server cert + intermediates
+cert = "/etc/atlas/cert.pem"
+
+# Path to private key file (PEM format)
+key = "/etc/atlas/key.pem"
+
+# Backend server (HTTP, not HTTPS)
+[[upstreams]]
+name = "backend"
+address = "127.0.0.1"
+port = 3000
+
+[routing]
+strategy = "round_robin"

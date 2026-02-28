@@ -1,0 +1,29 @@
+# Atlas Reverse Proxy Configuration
+#
+# This configuration proxies HTTP requests to a backend server.
+# Features connection pooling and keep-alive for maximum throughput.
+
+[listen]
+# Bind address - use 0.0.0.0 for all interfaces
+address = "0.0.0.0"
+
+# Port to listen on
+port = 8080
+
+# Mode: "http" for HTTP reverse proxy
+mode = "http"
+
+# Number of worker threads (default: number of CPU cores)
+# Each worker maintains its own connection pool to upstreams
+workers = 4
+
+# Backend server
+[[upstreams]]
+name = "backend"
+address = "127.0.0.1"
+port = 3000
+
+[routing]
+# Load balancing strategy
+# Options: round_robin, weighted_round_robin, random
+strategy = "round_robin"
