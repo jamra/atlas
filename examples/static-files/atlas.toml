@@ -1,0 +1,30 @@
+# Atlas Static File Server Configuration
+#
+# This configuration serves static files from a directory.
+# Optimized for high throughput with in-memory caching and zero-copy sendfile.
+
+[listen]
+# Bind address - use 0.0.0.0 for all interfaces
+address = "0.0.0.0"
+
+# Port to listen on
+port = 8080
+
+# Mode: "static" for serving files
+mode = "static"
+
+# Number of worker threads (default: number of CPU cores)
+# Each worker has its own event loop and file cache
+workers = 4
+
+# Document root - all requests are served relative to this path
+root = "/var/www/html"
+
+# Upstreams are not used in static mode, but required by config parser
+[[upstreams]]
+name = "unused"
+address = "127.0.0.1"
+port = 9999
+
+[routing]
+strategy = "round_robin"
