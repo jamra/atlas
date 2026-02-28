@@ -1,0 +1,50 @@
+[package]
+name = "atlas"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+lua = ["mlua"]
+
+[dependencies]
+# io_uring-based async runtime - maximum performance
+monoio = { version = "0.2", features = ["sync", "splice"] }
+
+# Lock-free config swapping for hot reload
+arc-swap = "1.7"
+
+# Config parsing
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# File watching for config hot reload
+notify = "6.1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1.0"
+
+# Fast HTTP parsing
+httparse = "1.8"
+
+# SIMD-accelerated byte search
+memchr = "2.7"
+
+# For splice/pipe operations
+libc = "0.2"
+
+# Cross-platform socket operations
+socket2 = "0.5"
+
+# Optional Lua scripting for advanced config
+mlua = { version = "0.10", features = ["lua54", "vendored"], optional = true }
+
+# TLS support
+monoio-rustls = "0.4"
+rustls = "0.23"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
