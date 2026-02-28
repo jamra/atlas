@@ -14,12 +14,36 @@ A high-performance load balancer and reverse proxy written in Rust, built on [mo
 
 ## Performance
 
-Benchmarked against nginx as a reverse proxy to an nginx backend:
+Benchmarked on Linux (4 CPU cores) using wrk with 4 threads.
 
-| Metric | Atlas | nginx |
-|--------|-------|-------|
-| Requests/sec (100 conn) | 128,000 | ~100,000 |
-| Latency (avg) | 1.67ms | ~2ms |
+### Static File Serving (1KB file)
+
+| Connections | Atlas | nginx | Difference |
+|-------------|-------|-------|------------|
+| 100 | 328,000 req/s | 162,000 req/s | **2x faster** |
+| 500 | 323,000 req/s | 156,000 req/s | **2x faster** |
+
+### Reverse Proxy (to nginx backend, 1KB response)
+
+| Connections | Atlas | nginx |
+|-------------|-------|-------|
+| 100 | 164,000 req/s | 157,000 req/s |
+| 500 | 144,000 req/s | 142,000 req/s |
+
+### TLS Termination (reverse proxy mode)
+
+| Mode | Requests/sec | Overhead |
+|------|--------------|----------|
+| Plain HTTP | 164,000 | baseline |
+| TLS (rustls) | 128,000 | 22% |
+
+### Latency
+
+| Scenario | Atlas (avg) | Atlas (p99) |
+|----------|-------------|-------------|
+| Static files | 0.35ms | 1.2ms |
+| Reverse proxy | 0.64ms | 2.1ms |
+| TLS proxy | 1.67ms | 5.2ms |
 
 ## Building
 
