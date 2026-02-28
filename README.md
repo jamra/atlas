@@ -11,6 +11,7 @@ A high-performance load balancer and reverse proxy written in Rust, built on [mo
 - **Static file serving** - With in-memory caching and zero-copy sendfile
 - **Hot config reload** - File watcher for configuration changes
 - **Multiple load balancing strategies** - Round-robin, random, least connections
+- **Socket takeover** - Zero-downtime deploys via FD passing (inspired by Meta's paper)
 
 ## Performance
 
@@ -95,7 +96,29 @@ Changes take effect immediately without restarting.
 
 ## Zero-Downtime Deployments
 
-Atlas supports graceful shutdown for zero-downtime deployments:
+Atlas supports two methods for zero-downtime deployments:
+
+### Socket Takeover (Recommended)
+
+Based on [Meta's Zero Downtime Release paper](https://research.facebook.com/publications/zero-downtime-release-disruption-free-load-balancing-of-a-multi-billion-user-website/), Atlas can pass listening socket file descriptors from an old process to a new process via Unix domain sockets with `SCM_RIGHTS`. This ensures no connections are dropped during deployment.
+
+```bash
+# 1. New Atlas connects to old process and takes over listening sockets
+./atlas-new config.toml --takeover
+
+# 2. Old process automatically starts draining connections (30s timeout)
+# 3. Old process exits when drain completes
+```
+
+The `--takeover` flag tells the new process to connect to the existing Atlas via a Unix socket (default: `/tmp/atlas-takeover.sock`) and receive the listening socket FDs. The old process then gracefully drains existing connections while the new process handles all new connections.
+
+Options:
+- `--takeover` - Connect to existing process and take over sockets
+- `--takeover-socket PATH` - Custom path for takeover socket (default: `/tmp/atlas-takeover.sock`)
+
+### SO_REUSEPORT (Fallback)
+
+If socket takeover isn't available, you can use `SO_REUSEPORT`:
 
 ```bash
 # 1. Start new Atlas version (binds alongside old via SO_REUSEPORT)
@@ -107,7 +130,10 @@ kill -TERM $OLD_PID
 # 3. Old process stops accepting, drains connections (30s timeout), exits
 ```
 
-Signals:
+Note: With `SO_REUSEPORT`, there's a brief window where both processes accept connections, which may cause issues with stateful protocols.
+
+### Signals
+
 - `SIGTERM` / `SIGINT` / `SIGQUIT` - Graceful shutdown (drain connections)
 
 ## Architecture

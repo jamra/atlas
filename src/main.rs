@@ -5,6 +5,8 @@ mod http_proxy;
 mod ktls;
 mod pipe_pool;
 mod static_files;
+#[cfg(unix)]
+mod takeover;
 mod tls;
 
 use anyhow::Result;
@@ -16,9 +18,52 @@ use http_proxy::proxy_http_connection;
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt, Splitable};
 use monoio::net::tcp::{TcpOwnedReadHalf, TcpOwnedWriteHalf};
 use monoio::net::TcpListener;
+use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
+
+/// Command-line arguments
+struct Args {
+    config_path: String,
+    /// Connect to existing process for takeover
+    takeover: bool,
+    /// Socket path for takeover communication
+    takeover_socket: String,
+}
+
+impl Args {
+    fn parse() -> Self {
+        let mut args = std::env::args().skip(1);
+        let mut config_path = "atlas.toml".to_string();
+        let mut takeover = false;
+        let mut takeover_socket = takeover::DEFAULT_TAKEOVER_SOCKET.to_string();
+
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--takeover" => takeover = true,
+                "--takeover-socket" => {
+                    if let Some(path) = args.next() {
+                        takeover_socket = path;
+                    }
+                }
+                s if s.starts_with("--takeover-socket=") => {
+                    takeover_socket = s.trim_start_matches("--takeover-socket=").to_string();
+                }
+                s if !s.starts_with('-') => {
+                    config_path = s.to_string();
+                }
+                _ => {}
+            }
+        }
+
+        Self {
+            config_path,
+            takeover,
+            takeover_socket,
+        }
+    }
+}
 
 struct LoadBalancer {
     config: Arc<ArcSwap<Config>>,
@@ -218,8 +263,8 @@ async fn proxy_connection(
     Ok(())
 }
 
-/// Worker thread running its own monoio runtime
-fn run_worker(
+/// Configuration for a worker thread
+struct WorkerConfig {
     worker_id: usize,
     listen_addr: String,
     lb: Arc<LoadBalancer>,
@@ -228,11 +273,27 @@ fn run_worker(
     file_cache: Option<Arc<static_files::FileCache>>,
     tls_acceptor: Option<monoio_rustls::TlsAcceptor>,
     shutdown: Arc<AtomicBool>,
-) {
+    /// Pre-existing listener FD (from takeover), if any
+    listener_fd: Option<RawFd>,
+}
+
+/// Worker thread running its own monoio runtime
+fn run_worker(config: WorkerConfig) {
+    let WorkerConfig {
+        worker_id,
+        listen_addr,
+        lb,
+        total_connections,
+        active_connections,
+        file_cache,
+        tls_acceptor,
+        shutdown,
+        listener_fd,
+    } = config;
+
     // Pin thread to CPU core for better cache locality
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::thread::JoinHandleExt;
         let core_id = worker_id % num_cpus();
         unsafe {
             let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
@@ -251,9 +312,15 @@ fn run_worker(
         .expect("Failed to build monoio runtime");
 
     rt.block_on(async move {
-        // Use SO_REUSEPORT to allow multiple threads to accept on same port
-        // SO_REUSEPORT must be set BEFORE bind()
-        let listener = {
+        // Either use the passed FD (takeover mode) or create a new listener
+        let listener = if let Some(fd) = listener_fd {
+            // Takeover mode: use the received FD
+            use std::os::unix::io::FromRawFd;
+            let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+            std_listener.set_nonblocking(true).expect("Failed to set non-blocking");
+            TcpListener::from_std(std_listener).expect("Failed to convert listener")
+        } else {
+            // Normal mode: create a new listener with SO_REUSEPORT
             use socket2::{Domain, Protocol, Socket, Type};
             use std::net::SocketAddr;
 
@@ -277,8 +344,9 @@ fn run_worker(
             TcpListener::from_std(std_listener).expect("Failed to convert listener")
         };
 
-        info!("Worker {} listening on {}{}", worker_id, listen_addr,
-            if tls_acceptor.is_some() { " (TLS)" } else { "" });
+        info!("Worker {} listening on {}{}{}", worker_id, listen_addr,
+            if tls_acceptor.is_some() { " (TLS)" } else { "" },
+            if listener_fd.is_some() { " (takeover)" } else { "" });
 
         loop {
             // Check for shutdown signal
@@ -511,19 +579,45 @@ fn main() -> Result<()> {
     // Increase fd limit for high concurrency
     increase_fd_limit();
 
-    let config_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "atlas.toml".to_string());
-
-    let config = Config::load(&config_path)?;
+    let args = Args::parse();
+    let config = Config::load(&args.config_path)?;
     let listen_addr = format!("{}:{}", config.listen.address, config.listen.port);
 
     let num_workers = config.listen.workers.unwrap_or_else(num_cpus);
     let proxy_mode = config.listen.mode.clone();
 
+    // Check if we're doing a takeover from existing process
+    #[cfg(unix)]
+    let takeover_fds: Option<Vec<RawFd>> = if args.takeover {
+        info!("Connecting to existing Atlas process for takeover...");
+        let mut client = takeover::TakeoverClient::connect(&args.takeover_socket)
+            .expect("Failed to connect to existing process. Is it running?");
+        let fds = client.perform_takeover()
+            .expect("Takeover handshake failed");
+
+        if fds.len() != num_workers {
+            warn!("Received {} FDs but expected {} workers", fds.len(), num_workers);
+        }
+
+        // Signal old process to start draining
+        client.signal_drain().expect("Failed to signal drain");
+        info!("Takeover successful, received {} listening sockets", fds.len());
+
+        Some(fds)
+    } else {
+        None
+    };
+
+    #[cfg(not(unix))]
+    let takeover_fds: Option<Vec<RawFd>> = None;
+
     info!("Atlas load balancer starting on {}", listen_addr);
     info!("Mode: {:?}", proxy_mode);
-    info!("Workers: {} (thread-per-core with SO_REUSEPORT)", num_workers);
+    if takeover_fds.is_some() {
+        info!("Workers: {} (using takeover sockets)", num_workers);
+    } else {
+        info!("Workers: {} (thread-per-core with SO_REUSEPORT)", num_workers);
+    }
     info!(
         "Loaded {} upstream(s): {:?}",
         config.upstreams.len(),
@@ -536,7 +630,7 @@ fn main() -> Result<()> {
 
     // Spawn config watcher in background
     let lb_clone = Arc::clone(&lb);
-    let config_path_clone = config_path.clone();
+    let config_path_clone = args.config_path.clone();
     std::thread::spawn(move || {
         watch_config(config_path_clone, lb_clone);
     });
@@ -569,6 +663,38 @@ fn main() -> Result<()> {
     // Graceful shutdown flag
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    // For non-takeover mode, we need to create listeners and store their FDs for takeover server
+    #[cfg(unix)]
+    let listener_fds: Vec<RawFd> = if takeover_fds.is_none() {
+        // Create listening sockets that workers will use
+        // These are created here so we can pass them to the takeover server
+        use socket2::{Domain, Protocol, Socket, Type};
+        use std::net::SocketAddr;
+        use std::os::unix::io::IntoRawFd;
+
+        let addr: SocketAddr = listen_addr.parse().expect("Invalid listen address");
+        let domain = if addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+
+        let mut fds = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+                .expect("Failed to create socket");
+
+            socket.set_reuse_address(true).expect("Failed to set SO_REUSEADDR");
+            socket.set_reuse_port(true).expect("Failed to set SO_REUSEPORT");
+            socket.set_nonblocking(true).expect("Failed to set non-blocking");
+
+            socket.bind(&addr.into()).expect("Failed to bind");
+            socket.listen(1024).expect("Failed to listen");
+
+            let std_listener: std::net::TcpListener = socket.into();
+            fds.push(std_listener.into_raw_fd());
+        }
+        fds
+    } else {
+        takeover_fds.clone().unwrap()
+    };
+
     // Spawn worker threads
     let mut handles = Vec::new();
     for worker_id in 0..num_workers {
@@ -578,12 +704,32 @@ fn main() -> Result<()> {
         let active = Arc::clone(&active_connections);
         let cache = file_cache.clone();
         let tls = tls_acceptor.clone();
-        let shutdown = Arc::clone(&shutdown);
+        let shutdown_clone = Arc::clone(&shutdown);
+
+        #[cfg(unix)]
+        let listener_fd = if worker_id < listener_fds.len() {
+            Some(listener_fds[worker_id])
+        } else {
+            None
+        };
+
+        #[cfg(not(unix))]
+        let listener_fd = None;
 
         let handle = std::thread::Builder::new()
             .name(format!("atlas-worker-{}", worker_id))
             .spawn(move || {
-                run_worker(worker_id, listen_addr, lb, total, active, cache, tls, shutdown);
+                run_worker(WorkerConfig {
+                    worker_id,
+                    listen_addr,
+                    lb,
+                    total_connections: total,
+                    active_connections: active,
+                    file_cache: cache,
+                    tls_acceptor: tls,
+                    shutdown: shutdown_clone,
+                    listener_fd,
+                });
             })
             .expect("Failed to spawn worker thread");
 
@@ -592,12 +738,55 @@ fn main() -> Result<()> {
 
     info!("All {} workers started", num_workers);
 
-    // Set up signal handling for graceful shutdown
+    // Set up signal handling and takeover server
     #[cfg(unix)]
     {
         use std::sync::mpsc::channel;
-        let (sig_tx, sig_rx) = channel();
+        let (sig_tx, sig_rx) = channel::<ShutdownReason>();
         let shutdown_flag = Arc::clone(&shutdown);
+
+        // Clone for takeover thread
+        let takeover_shutdown = Arc::clone(&shutdown);
+        let takeover_sig_tx = sig_tx.clone();
+        let takeover_socket_path = args.takeover_socket.clone();
+
+        // Only start takeover server if we're not already a takeover child
+        // (the new process shouldn't accept takeover requests immediately)
+        if takeover_fds.is_none() {
+            // Spawn takeover server thread (listens for new process connections)
+            // Need to dup the listener FDs so takeover server can pass them
+            let fds_for_takeover: Vec<RawFd> = listener_fds.iter().map(|&fd| {
+                unsafe { libc::dup(fd) }
+            }).collect();
+
+            std::thread::spawn(move || {
+                match takeover::TakeoverServer::new(&takeover_socket_path) {
+                    Ok(server) => {
+                        // Block waiting for a new process to connect
+                        match server.handle_takeover(&fds_for_takeover) {
+                            Ok(true) => {
+                                info!("Takeover requested, initiating shutdown...");
+                                takeover_shutdown.store(true, Ordering::SeqCst);
+                                let _ = takeover_sig_tx.send(ShutdownReason::Takeover);
+                            }
+                            Ok(false) => {
+                                warn!("Takeover handshake failed");
+                            }
+                            Err(e) => {
+                                error!("Takeover error: {}", e);
+                            }
+                        }
+                        // Clean up duped FDs
+                        for fd in fds_for_takeover {
+                            unsafe { libc::close(fd) };
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to start takeover server: {}", e);
+                    }
+                }
+            });
+        }
 
         // Spawn signal handler thread
         std::thread::spawn(move || {
@@ -622,12 +811,22 @@ fn main() -> Result<()> {
 
                 info!("Received signal {}, initiating graceful shutdown...", sig);
                 shutdown_flag.store(true, Ordering::SeqCst);
-                let _ = sig_tx.send(());
+                let _ = sig_tx.send(ShutdownReason::Signal(sig));
             }
         });
 
-        // Wait for shutdown signal
-        let _ = sig_rx.recv();
+        // Wait for shutdown signal (from either takeover or signal handler)
+        match sig_rx.recv() {
+            Ok(ShutdownReason::Takeover) => {
+                info!("Shutting down due to takeover...");
+            }
+            Ok(ShutdownReason::Signal(sig)) => {
+                info!("Shutting down due to signal {}...", sig);
+            }
+            Err(_) => {
+                warn!("Shutdown channel closed");
+            }
+        }
 
         info!("Waiting for workers to drain connections (30s timeout)...");
     }
@@ -649,6 +848,15 @@ fn main() -> Result<()> {
     info!("Atlas shutdown complete. Served {} total connections.", total);
 
     Ok(())
+}
+
+/// Reason for shutdown
+#[derive(Debug)]
+enum ShutdownReason {
+    /// Received a signal (SIGTERM, SIGINT, SIGQUIT)
+    Signal(i32),
+    /// A new process took over via socket takeover
+    Takeover,
 }
 
 fn watch_config(config_path: String, lb: Arc<LoadBalancer>) {
